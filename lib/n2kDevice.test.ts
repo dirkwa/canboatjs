@@ -253,6 +253,7 @@ describe('identical NAME address claims', () => {
     const app = {
       on: () => undefined,
       removeListener: () => undefined,
+      emit: () => undefined,
       setProviderError: jest.fn(),
       setProviderStatus: jest.fn()
     }
@@ -265,14 +266,20 @@ describe('identical NAME address claims', () => {
     expect(dev.address).not.toBe(before)
     expect((dev.addressClaim as any).fields.uniqueNumber).toBe(613748)
     expect(dev.foundConflict).toBe(true)
+    // the error names the value that collided
     expect(app.setProviderError).toHaveBeenCalledWith(
       'test',
-      expect.stringContaining('identical NAME')
+      expect.stringContaining('613748')
     )
-    // the re-claim goes out after the randomized decorrelation delay
+    // claim-silent until the new address has been claimed
+    expect(dev.cansend).toBe(false)
+    // the re-claim goes out after the randomized decorrelation delay,
+    // and cansend returns once the claim-detection window passes
     expect(canbus.sendPGN).not.toHaveBeenCalled()
     jest.advanceTimersByTime(160)
     expect(canbus.sendPGN).toHaveBeenCalled()
+    jest.advanceTimersByTime(5000)
+    expect(dev.cansend).toBe(true)
   })
 
   test('unconfigured uniqueNumber: re-randomizes and persists a new one', () => {
@@ -303,6 +310,9 @@ describe('identical NAME address claims', () => {
     const seen: number[] = []
     for (let i = 0; i < 6; i++) {
       seen.push(dev.address)
+      // each reaction claim-silences the device; model spaced-out
+      // events where the claim has completed in between
+      dev.cansend = true
       dev.n2kMessage(claimForOwnAddress(dev))
     }
 
@@ -339,6 +349,7 @@ describe('identical NAME address claims', () => {
     dev.cansend = true
 
     for (let i = 0; i < 6; i++) {
+      dev.cansend = true
       dev.n2kMessage(claimForOwnAddress(dev))
     }
     expect(dev.identicalClaimReactions).toBe(4)

@@ -536,6 +536,9 @@ function handleIdenticalNameClaim(device: N2kDevice) {
 
   const fields = (device.addressClaim.fields = device.addressClaim.fields || {})
   const configured = device.uniqueNumberConfigured
+  // captured before the re-randomization below so the error names the
+  // value that actually collided, not its just-generated replacement
+  const duplicateUniqueNumber = fields.uniqueNumber
   if (!configured) {
     const newUniqueNumber = Math.floor(Math.random() * Math.floor(2097151))
     device.debug(
@@ -550,13 +553,18 @@ function handleIdenticalNameClaim(device: N2kDevice) {
 
   const msg =
     `Another device claimed address ${device.address} with our identical NAME` +
-    ` (uniqueNumber ${fields.uniqueNumber})` +
+    ` (uniqueNumber ${duplicateUniqueNumber})` +
     (configured ? ' — configure distinct uniqueNumbers on each device.' : '.') +
     ' Moving to another address.'
   console.error(msg)
   device.setError(msg)
 
   increaseOwnAddress(device)
+  // Claim-silence until the re-claim's detection window passes:
+  // transmitting from — or accepting unicast for — the new address
+  // before it has been claimed would violate the claim protocol.
+  // sendAddressClaim's checker restores cansend afterwards.
+  device.cansend = false
   if (device.identicalClaimTimer) {
     clearTimeout(device.identicalClaimTimer)
   }
