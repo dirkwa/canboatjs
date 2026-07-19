@@ -60,6 +60,11 @@ export class N2kDevice extends EventEmitter {
   addressClaimSentAt?: number
   addressClaimChecker?: any
   heartbeatInterval?: any
+  identicalClaimReactions: number
+  identicalClaimWindowStart?: number
+  identicalClaimSuppressed: boolean
+  identicalClaimTimer?: any
+  uniqueNumberConfigured: boolean
   debug: any
 
   constructor(options: any, debugName: string) {
@@ -154,6 +159,17 @@ export class N2kDevice extends EventEmitter {
     // caller-supplied claim's identity instead of silently overwriting it.
     const ac: any = this.addressClaim
     const fields = (ac.fields = ac.fields || {})
+    // A uniqueNumber is "configured" — deliberate user identity that
+    // conflict handling must never re-randomize — when it came from
+    // options.uniqueNumber or was carried on a caller-supplied
+    // addressClaim. A value backfilled below from persistence or a
+    // random draw is ours to regenerate.
+    this.uniqueNumberConfigured =
+      options.uniqueNumber !== undefined ||
+      (options.addressClaim !== undefined &&
+        (fields.uniqueNumber !== undefined ||
+          ac.uniqueNumber !== undefined ||
+          ac['Unique Number'] !== undefined))
     if (fields.uniqueNumber === undefined) {
       const legacy = ac.uniqueNumber ?? ac['Unique Number']
       if (legacy !== undefined) {
@@ -206,6 +222,8 @@ export class N2kDevice extends EventEmitter {
     this.address = address!
     this.cansend = false
     this.foundConflict = false
+    this.identicalClaimReactions = 0
+    this.identicalClaimSuppressed = false
     this.heartbeatCounter = 0
     this.devices = {}
     this.sentAvailable = false
@@ -240,6 +258,10 @@ export class N2kDevice extends EventEmitter {
     if (this.addressClaimChecker) {
       clearTimeout(this.addressClaimChecker)
       this.addressClaimChecker = undefined
+    }
+    if (this.identicalClaimTimer) {
+      clearTimeout(this.identicalClaimTimer)
+      this.identicalClaimTimer = undefined
     }
     this.cansend = false
   }
@@ -444,7 +466,12 @@ function handleISOAddressClaim(device: N2kDevice, n2kMsg: PGN_60928) {
     device.addressClaim
   )
 
-  if (uint64ValueFromOurOwnClaim < uint64ValueFromReceivedClaim) {
+  if (
+    uint64ValueFromOurOwnClaim.toString() ===
+    uint64ValueFromReceivedClaim.toString()
+  ) {
+    handleIdenticalNameClaim(device)
+  } else if (uint64ValueFromOurOwnClaim < uint64ValueFromReceivedClaim) {
     device.debug(
       `Address conflict detected! Kept our address as ${device.address}.`
     )
@@ -457,6 +484,89 @@ function handleISOAddressClaim(device: N2kDevice, n2kMsg: PGN_60928) {
     )
     sendAddressClaim(device)
   }
+}
+
+const IDENTICAL_CLAIM_MAX_REACTIONS = 4
+const IDENTICAL_CLAIM_WINDOW = 60 * 1000
+
+// An incoming claim for OUR address carrying OUR exact 64-bit NAME.
+//
+// ISO 11783-5 arbitration assumes NAMEs are unique, so the < / > branches
+// above can never resolve this: neither side yields, both devices keep
+// transmitting with the same source address, and at the CAN level that
+// means repeated collisions of identical arbitration IDs with different
+// data — error frames that eventually drive a controller error-passive or
+// bus-off. Seen in the field when a SignalK config dir is cloned to a
+// second machine on the same bus (identical configured or persisted
+// uniqueNumber).
+//
+// The tie is unwinnable, so yielding is the only safe move: hop to a free
+// address, after a short random delay so two identical twins that react
+// to each other simultaneously don't hop in lockstep. When our
+// uniqueNumber wasn't explicitly configured, also re-randomize and persist
+// it so the NAMEs differ and every later conflict resolves by normal
+// arbitration; a configured uniqueNumber is user intent, so it is kept
+// and a loud error asks for distinct values instead.
+//
+// Reactions are capped per time window: a transport that echoes our own
+// transmissions back to us is indistinguishable from an identical twin,
+// and hopping forever would be worse than the standoff. After the cap we
+// stay put and surface the error.
+function handleIdenticalNameClaim(device: N2kDevice) {
+  const now = Date.now()
+  if (
+    device.identicalClaimWindowStart === undefined ||
+    now - device.identicalClaimWindowStart > IDENTICAL_CLAIM_WINDOW
+  ) {
+    device.identicalClaimWindowStart = now
+    device.identicalClaimReactions = 0
+    device.identicalClaimSuppressed = false
+  }
+  if (device.identicalClaimReactions >= IDENTICAL_CLAIM_MAX_REACTIONS) {
+    if (!device.identicalClaimSuppressed) {
+      device.identicalClaimSuppressed = true
+      const msg = `Repeated identical address claims for address ${device.address} — giving up conflict resolution (own transmissions echoed back?)`
+      console.error(msg)
+      device.setError(msg)
+    }
+    return
+  }
+  device.identicalClaimReactions++
+  device.foundConflict = true
+
+  const fields = (device.addressClaim.fields = device.addressClaim.fields || {})
+  const configured = device.uniqueNumberConfigured
+  if (!configured) {
+    const newUniqueNumber = Math.floor(Math.random() * Math.floor(2097151))
+    device.debug(
+      `re-randomizing uniqueNumber ${fields.uniqueNumber} -> ${newUniqueNumber}`
+    )
+    fields.uniqueNumber = newUniqueNumber
+    if (device.productInfo?.fields) {
+      device.productInfo.fields.modelSerialCode = newUniqueNumber.toString()
+    }
+    device.savePersistedData('uniqueNumber', newUniqueNumber)
+  }
+
+  const msg =
+    `Another device claimed address ${device.address} with our identical NAME` +
+    ` (uniqueNumber ${fields.uniqueNumber})` +
+    (configured ? ' — configure distinct uniqueNumbers on each device.' : '.') +
+    ' Moving to another address.'
+  console.error(msg)
+  device.setError(msg)
+
+  increaseOwnAddress(device)
+  if (device.identicalClaimTimer) {
+    clearTimeout(device.identicalClaimTimer)
+  }
+  device.identicalClaimTimer = setTimeout(
+    () => {
+      device.identicalClaimTimer = undefined
+      sendAddressClaim(device)
+    },
+    Math.floor(Math.random() * 153)
+  )
 }
 
 function increaseOwnAddress(device: N2kDevice) {
